@@ -1,0 +1,653 @@
+substitutions:
+  name: prusa-mk4-smart-enclosure
+  friendly_name: Prusa MK4 smart enclosure
+  api_encryption_key: "add your encryption key here"
+  ota_password: "add your OTA password here"
+  frame_rate_buffer_size: "10"
+  resolution: 640x480
+  fan_speed_steps: "3"
+  fan_minimum_speed_duty_cycle: "0.2"
+  idle_framerate: "0.1"
+  automatic_camera_light_framerate: "0.3"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: false
+  on_boot:
+    priority: 300
+    then:
+      - script.execute: enable_automatic_filtration
+      - script.execute: evaluate_automatic_filtration
+      - script.execute: evaluate_automatic_lighting
+    
+esp32:
+  board: seeed_xiao_esp32s3
+  variant: esp32s3 
+  framework:
+    type: arduino
+    version: 2.0.8
+    platform_version: 6.2.0
+
+psram:
+  mode: octal
+  speed: 120MHz
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/Rudd-O/esphome_freenove_camera_component
+    components:
+      - esp32_camera
+  # Optionally comment the following block out if you are not using the
+  # optional BME688 sensor.  Keep the following two lines uncommented otherwise.
+  - source: github://neffs/esphome@bsec2_bme68x
+    components: [ bme68x_bsec ]
+
+# Enable logging
+logger:
+  # Change me from debug to info when everything has been tested to work correctly.
+  level: debug
+  logs:
+    pulse_counter: info
+    sensor: info
+    fan.automatic: info
+    text_sensor: info
+
+# Enable Home Assistant API.
+# Comment this whole block if not using Home Assistant.
+api:
+  encryption:
+    key: "$api_encryption_key"
+  # Comment the following line after pairing with Home Assistant.
+  # Leave it uncommented if you plan to use only the ESP32 Web server
+  # integration below.
+  reboot_timeout: 0s
+
+ota:
+  password: "$ota_password"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+# Leave this block uncomemented for initial testing.
+# Later on, comment this block if you will only be using Home Assistant
+# to control your smart enclosure.  Leave it uncommented if you plan to
+# control your smart enclosure through the ESP32 Web server.
+# Reflash via Wi-Fi after that change.
+web_server:
+  port: 80
+  include_internal: true
+  local: true
+
+# Leave this block uncommented for initial testing.
+# Later on, comment this block if you will only be using the camera
+# through Home Assistant instead of streaming MJPEG to Frigate or
+# another NVR solution.  Reflash via Wi-Fi after that change.
+esp32_camera_web_server:
+  - port: 8080
+    mode: stream
+  - port: 8081
+    mode: snapshot
+
+globals:
+  - id: last_update_times
+    type: unsigned int[$frame_rate_buffer_size]
+    restore_value: no
+
+script:
+  - id: evaluate_automatic_filtration
+    then:
+      - lambda: |
+          if (id(advanced_filtration_system).preset_mode == "automatic") {
+            // Q: Why do we use static IAQ?
+            // A: https://community.bosch-sensortec.com/t5/MEMS-sensors-forum/Explanation-on-static-IAQ-breath-VOC-and-CO2-equivalent/m-p/7536/highlight/true#M483
+            float iaq_ = float(id(static_iaq).state);
+            if (iaq_ == -2.0) {
+              auto printer_printing = !(id(printer).state == "finished" || id(printer).state == "idle" || id(printer).state == "unknown");
+              if (
+                  !printer_printing
+                  &&
+                  id(advanced_filtration_system).state
+                ) {
+                ESP_LOGD("fan.automatic", "Turning off fan based on printer state");
+                auto call = id(advanced_filtration_system).make_call();
+                call.set_preset_mode("automatic"); // Copy preset mode into call so it won't get cleared
+                call.set_state(false);
+                call.perform();
+              } else if (
+                printer_printing
+                &&
+                !id(advanced_filtration_system).state
+              ) {
+                ESP_LOGD("fan.automatic", "Setting fan to maximum speed because the printer is %s", id(printer).state.c_str());
+                auto call = id(advanced_filtration_system).make_call();
+                call.set_preset_mode("automatic"); // Copy preset mode into call so it won't get cleared
+                call.set_speed($fan_speed_steps);
+                call.set_state(true);
+                call.perform();
+              }
+            } else {
+              float max_iaq = float(id(maximum_automatic_filtration).state);
+              float min_iaq = float(id(minimum_automatic_filtration).state);
+              int speed_we_want = int(ceil((iaq_ - min_iaq) / (max_iaq - min_iaq) * ($fan_speed_steps - 1)));
+              if (speed_we_want > $fan_speed_steps) speed_we_want = $fan_speed_steps;
+              if (speed_we_want < 0) speed_we_want = 0;
+              ESP_LOGD("fan.automatic", "IAQ %.1f / max %.1f / min %.1f / target_speed %d", iaq_, max_iaq, min_iaq, speed_we_want);
+              if (speed_we_want == 0 && id(advanced_filtration_system).state) {
+                ESP_LOGD("fan.automatic", "Turning off fan");
+                auto call = id(advanced_filtration_system).make_call();
+                call.set_preset_mode("automatic"); // Copy preset mode into call so it won't get cleared
+                call.set_state(false);
+                call.perform();
+              } else if (speed_we_want > 0 && (!id(advanced_filtration_system).state || id(advanced_filtration_system).speed != speed_we_want)) {
+                ESP_LOGD("fan.automatic", "Setting fan to speed %d", speed_we_want);
+                auto call = id(advanced_filtration_system).make_call();
+                call.set_preset_mode("automatic"); // Copy preset mode into call so it won't get cleared
+                call.set_speed(speed_we_want);
+                call.set_state(true);
+                call.perform();
+              }
+            }
+          }
+  - id: enable_automatic_filtration
+    then:
+      - lambda: |
+          auto call = id(advanced_filtration_system).make_call();
+          call.set_preset_mode("automatic");
+          call.perform();
+  - id: evaluate_automatic_lighting
+    then:
+      - lambda: |
+          if (id(automatic_camera_light).state) {
+            auto framerate = float(id(camera_frame_rate).state);
+            if (framerate >= $automatic_camera_light_framerate && !id(camera_light).current_values.is_on()) {
+              ESP_LOGD("light.automatic", "Turning on light based on camera state");
+              auto call = id(camera_light).turn_on();
+              call.perform();
+            } else if (framerate < $automatic_camera_light_framerate && id(camera_light).current_values.is_on()) {
+              ESP_LOGD("light.automatic", "Turning off light based on camera state");
+              auto call = id(camera_light).turn_off();
+              call.perform();
+            }
+          }
+
+# Comment the following block out if you are not using any I2C sensor.
+i2c:
+  sda: GPIO40
+  scl: GPIO39
+# Comment the following line if you are not using the BME688 sensor,
+# keep it uncommented if you are.
+  frequency: 400kHz
+
+# Keep the following block uncommented if you are using the BME688 sensor.
+# Comment it if you are not.
+bme68x_bsec:
+  state_save_interval: 30min
+  bsec_configuration: 0,0,4,2,189,1,0,0,0,0,0,0,158,7,0,0,176,0,1,0,0,192,168,71,64,49,119,76,0,0,97,69,0,0,97,69,137,65,0,63,0,0,0,63,0,0,64,63,205,204,204,62,10,0,3,0,0,0,96,64,23,183,209,56,0,0,0,0,0,0,0,0,0,0,0,0,205,204,204,189,0,0,0,0,0,0,0,0,0,0,128,63,0,0,0,0,0,0,128,63,0,0,0,0,0,0,0,0,0,0,128,63,0,0,0,0,0,0,128,63,0,0,0,0,0,0,0,0,0,0,128,63,0,0,0,0,0,0,128,63,82,73,157,188,95,41,203,61,118,224,108,63,155,230,125,63,191,14,124,63,0,0,160,65,0,0,32,66,0,0,160,65,0,0,32,66,0,0,32,66,0,0,160,65,0,0,32,66,0,0,160,65,8,0,2,0,236,81,133,66,16,0,3,0,10,215,163,60,10,215,35,59,10,215,35,59,13,0,5,0,0,0,0,0,100,35,41,29,86,88,0,9,0,229,208,34,62,0,0,0,0,0,0,0,0,218,27,156,62,225,11,67,64,0,0,160,64,0,0,0,0,0,0,0,0,94,75,72,189,93,254,159,64,66,62,160,191,0,0,0,0,0,0,0,0,33,31,180,190,138,176,97,64,65,241,99,190,0,0,0,0,0,0,0,0,167,121,71,61,165,189,41,192,184,30,189,64,12,0,10,0,0,0,0,0,0,0,0,0,13,5,11,0,1,2,2,207,61,208,65,149,110,24,66,180,108,177,65,219,148,13,192,70,132,58,66,163,58,140,192,12,99,178,192,185,59,255,193,178,213,175,63,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,110,211,55,195,237,6,56,67,0,0,0,0,0,0,0,0,26,3,255,63,61,246,7,192,171,201,228,192,249,144,215,63,237,199,104,193,128,158,216,64,117,140,155,63,137,120,129,67,108,109,253,191,0,0,0,0,81,64,57,68,103,241,231,64,109,29,152,192,209,43,193,63,93,54,30,65,197,46,92,64,128,27,224,192,6,20,144,191,56,179,130,64,0,0,0,0,43,156,59,196,33,217,100,194,104,77,72,65,15,103,175,191,249,252,12,193,63,117,253,192,233,5,141,65,155,42,25,64,13,88,249,191,0,0,0,0,48,141,122,190,204,150,44,192,36,162,29,193,96,59,39,189,54,202,48,65,151,205,68,64,79,105,55,193,53,120,53,192,77,211,32,192,0,0,0,0,193,207,92,65,239,201,76,65,208,70,82,66,81,63,96,65,48,179,0,194,251,96,242,193,176,51,96,194,153,114,98,66,144,247,64,65,0,0,0,0,219,179,180,63,175,218,119,191,51,71,207,191,245,145,129,63,53,16,244,65,138,208,117,65,138,97,36,66,228,15,32,195,126,91,103,191,0,0,0,0,26,151,170,193,64,105,49,193,46,223,189,193,129,203,168,193,40,91,49,66,4,87,107,65,205,202,37,65,244,36,154,66,240,85,39,193,0,0,0,0,166,96,87,192,114,7,68,191,233,32,214,63,84,249,40,192,45,78,132,64,145,33,253,61,49,43,187,192,244,32,77,67,224,250,71,191,0,0,0,0,103,75,214,190,206,141,252,63,99,15,178,65,80,79,166,190,214,25,146,192,165,29,24,194,18,228,219,193,113,246,235,194,49,115,232,63,0,0,0,0,17,211,124,64,56,252,251,62,25,118,148,193,168,234,94,64,131,157,82,64,217,119,236,65,120,245,240,65,17,69,168,195,49,51,8,63,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,131,217,97,66,182,104,101,194,0,0,0,0,0,0,0,0,6,142,142,195,229,54,143,67,0,0,0,0,0,0,0,0,25,224,153,66,217,51,154,194,0,0,0,0,0,0,0,0,142,36,105,194,199,63,110,66,0,0,0,0,0,0,0,0,206,73,250,193,138,69,249,65,0,0,0,0,0,0,0,0,123,173,127,66,20,116,128,194,0,0,0,0,0,0,0,0,49,65,49,64,205,213,107,192,0,0,0,0,0,0,0,0,189,250,179,194,164,98,180,66,0,0,0,0,0,0,0,0,96,182,197,67,155,71,197,195,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,9,0,2,185,28,179,73,64,25,141,76,223,26,138,76,222,207,133,76,87,134,164,75,23,127,159,75,166,9,155,75,94,120,170,73,95,221,177,73,93,44,182,73,0,0,0,0,0,0,0,0,0,0,0,0,30,55,120,73,215,98,32,76,7,79,34,76,161,238,36,76,119,151,160,75,119,96,157,75,202,75,154,75,118,89,111,73,133,239,116,73,219,140,120,73,0,0,128,63,0,0,128,63,0,0,128,63,0,0,0,88,1,254,0,2,1,5,48,117,100,0,44,1,112,23,151,7,132,3,197,0,92,4,144,1,64,1,64,1,144,1,48,117,48,117,48,117,48,117,100,0,100,0,100,0,48,117,48,117,48,117,100,0,100,0,48,117,48,117,8,7,8,7,8,7,8,7,8,7,100,0,100,0,100,0,100,0,48,117,48,117,48,117,100,0,100,0,100,0,48,117,48,117,100,0,100,0,255,255,255,255,255,255,255,255,255,255,44,1,44,1,44,1,44,1,44,1,44,1,44,1,44,1,44,1,44,1,44,1,44,1,44,1,44,1,255,255,255,255,255,255,255,255,255,255,112,23,112,23,112,23,112,23,8,7,8,7,8,7,8,7,112,23,112,23,112,23,112,23,112,23,112,23,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,112,23,112,23,112,23,112,23,255,255,255,255,220,5,220,5,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,220,5,220,5,220,5,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,44,1,0,5,10,5,0,2,0,10,0,30,0,5,0,5,0,5,0,5,0,5,0,5,0,64,1,100,0,100,0,100,0,200,0,200,0,200,0,64,1,64,1,64,1,10,1,0,0,0,0,233,74,0,0
+
+esp32_camera:
+  name: Camera
+  id: camera
+  framebuffer_in_psram: true
+  external_clock:
+    pin: GPIO15
+    frequency: 40MHz
+  i2c_pins:
+    sda: GPIO4
+    scl: GPIO5
+  data_pins: [GPIO11, GPIO9, GPIO8, GPIO10, GPIO12, GPIO18, GPIO17, GPIO16]
+  vsync_pin: GPIO6
+  href_pin: GPIO7
+  pixel_clock_pin: GPIO13
+  idle_framerate: "$idle_framerate fps"
+  max_framerate: 15 fps
+  resolution: $resolution
+  horizontal_mirror: false
+  on_image:
+    - component.update: camera_frame_rate
+
+number:
+  - platform: template
+    name: Maximum automatic filtration
+    id: maximum_automatic_filtration
+    icon: mdi:fan-plus
+    optimistic: true
+    entity_category: config
+    unit_of_measurement: IAQ
+    step: 10
+    min_value: 0
+    max_value: 500
+    restore_value: true
+    initial_value: 200
+    on_value:
+      then:
+        - script.execute: evaluate_automatic_filtration
+  - platform: template
+    name: Minimum automatic filtration
+    id: minimum_automatic_filtration
+    icon: mdi:fan-minus
+    optimistic: true
+    entity_category: config
+    unit_of_measurement: IAQ
+    step: 10
+    min_value: 0
+    max_value: 500
+    restore_value: true
+    initial_value: 100
+    on_value:
+      then:
+        - script.execute: evaluate_automatic_filtration
+  # Uncomment the next block if you are not using a sensor that provides an
+  # IAQ index with ID `static_iaq`.  Leave it commented if you are using such a
+  # sensor (e.g. the optional BME688 suggested by this project).
+  # - platform: template
+  #   optimistic: true
+  #   internal: true
+  #   name: Static IAQ
+  #   id: static_iaq
+  #   restore_value: no
+  #   min_value: -2
+  #   initial_value: -2
+  #   step: 1
+  #   max_value: 1
+
+button:
+  - platform: restart
+    name: Restart
+    entity_category: diagnostic
+    icon: mdi:restart
+  - platform: safe_mode
+    name: Safe mode restart
+    entity_category: diagnostic
+    icon: mdi:restart-alert
+
+sensor:
+- platform: template
+  name: "Camera frame rate"
+  id: camera_frame_rate
+  lambda: |-
+    float now = millis();
+    unsigned int max_ = $frame_rate_buffer_size;
+    unsigned int i;
+    for (i = max_ - 1; i > 0; i--) {
+      id(last_update_times)[i] = id(last_update_times)[i-1];
+    }
+    id(last_update_times)[0] = now;
+    float avgdiff = 0.0;
+    float mostrecentmillis = id(last_update_times)[0];
+    for (i = 1; i < max_; i++) {
+      if (mostrecentmillis == 0) {
+        ESP_LOGD("framerate", "No more updates, breaking at %u", i);
+        break;
+      }
+      avgdiff = mostrecentmillis - id(last_update_times)[i];
+      if ((id(last_update_times)[i-1] - id(last_update_times)[i]) > 9500) {
+        ESP_LOGD("framerate", "Big diff, breaking at %u", i);
+        if (i > 1) {
+          // This is at least value number three from most
+          // recent to least recent.  Undo its use.
+          i = i - 1;
+          avgdiff = mostrecentmillis - id(last_update_times)[i];
+          ESP_LOGD("framerate", "Compensating avgdiff");
+        }
+        break;
+      }
+    }
+    if (avgdiff == 0.0) {
+      return {};
+    } else {
+      avgdiff = avgdiff / i;
+      float rate = 1000.0 / avgdiff;
+      //if (rate >= 5.0) {
+      //  rate = floor(rate + 0.5);
+      //} else {
+      //  rate = floor(rate * 10 + 0.5) / 10;
+      //}
+      return rate;
+    }
+  update_interval: never
+  entity_category: diagnostic
+  state_class: measurement
+  device_class: frequency
+  filters:
+    - heartbeat: 5s
+    - throttle_average: 5s
+    - delta: 0.25
+  on_value:
+    - script.execute: evaluate_automatic_lighting
+
+- platform: pulse_counter
+  pin:
+    number: GPIO14
+    mode:
+      input: true
+  name: "Advanced filtration system fan speed"
+  unit_of_measurement: RPM
+  update_interval: 2s
+  count_mode:
+    rising_edge: DISABLE
+    falling_edge: INCREMENT
+  accuracy_decimals: 0
+  filters:
+    - multiply: 0.5
+    - round: 0
+    - delta: 20
+
+- platform: uptime
+  name: "Uptime"
+  entity_category: diagnostic
+- platform: wifi_signal
+  name: "Wi-Fi signal strength"
+  update_interval: 10s
+  entity_category: "diagnostic"
+- platform: internal_temperature
+  name: "Device temperature"
+  update_interval: 10s
+  entity_category: "diagnostic"
+
+# Keep the following block uncommented if you are using the BME688 sensor
+# with the BSEC driver (the default).  Comment it if you are using any
+# other sensor, or no sensor at all.
+- platform: bme68x_bsec
+  temperature:
+    name: "Temperature"
+    filters:
+      - median
+  pressure:
+    name: "Pressure"
+    filters:
+      - median
+  humidity:
+    name: "Humidity"
+    filters:
+      - median
+  iaq:
+    name: "IAQ"
+    id: iaq
+    filters:
+      - median
+    on_value:
+      - component.update: iaq_classification
+  iaq_static:
+    name: "Static IAQ"
+    id: static_iaq
+    filters:
+      - median
+    on_value:
+      - component.update: static_iaq_classification
+      - script.execute: evaluate_automatic_filtration
+  co2_equivalent:
+    name: "CO2 equivalent"
+    filters:
+      - median
+  breath_voc_equivalent:
+    name: "Breath VOC equivalent"
+    filters:
+      - median
+  gas_resistance:
+    # Gas resistance in Ω
+    name: "Gas resistance"
+    filters:
+      - median
+
+switch:
+  - platform: template
+    name: Automatic camera light
+    id: automatic_camera_light
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    icon: mdi:lightbulb-auto
+    entity_category: config
+    internal: false
+    on_turn_on:
+      then:
+        - script.execute: evaluate_automatic_lighting
+    on_turn_off:
+      then:
+        - script.execute: evaluate_automatic_lighting
+
+binary_sensor:
+  - platform: gpio
+    icon: mdi:button-pointer
+    disabled_by_default: true
+    internal: false
+    pin:
+      number: GPIO43
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Camera light switch"
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: |
+                return id(automatic_camera_light).state;
+            then:
+              - switch.turn_off: automatic_camera_light
+              - light.turn_off: camera_light
+            else:
+              - if:
+                  condition:
+                    light.is_on: camera_light
+                  then:
+                    - light.control:
+                        id: camera_light
+                        state: off
+                    - delay: 100ms
+                    - light.control:
+                        id: camera_light
+                        state: on
+                    - delay: 100ms
+                    - light.control:
+                        id: camera_light
+                        state: off
+                    - delay: 100ms
+                    - light.control:
+                        id: camera_light
+                        state: on
+                    - delay: 100ms
+                    - switch.turn_on: automatic_camera_light
+                  else:
+                    - light.turn_on: camera_light
+  - platform: gpio
+    icon: mdi:button-pointer
+    disabled_by_default: true
+    internal: true
+    pin:
+      number: GPIO44
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "Advanced filtration system switch"
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: |
+                return float(id(static_iaq).state) == -2.0;
+            then:
+              - fan.cycle_speed: advanced_filtration_system
+            else:
+              - if:
+                  condition:
+                    lambda: |
+                      return id(advanced_filtration_system).preset_mode == "automatic";
+                  then:
+                    - fan.cycle_speed: advanced_filtration_system
+                  else:
+                    - if:
+                        condition:
+                          lambda: |
+                            return id(advanced_filtration_system).preset_mode != "automatic" && !id(advanced_filtration_system).state;
+                        then:
+                          - script.execute: enable_automatic_filtration
+                        else:
+                          - fan.cycle_speed: advanced_filtration_system
+
+output:
+  - platform: gpio
+    pin: GPIO47
+    id: "out_1"
+  - platform: ledc
+    frequency: 19531Hz
+    pin: GPIO21
+    id: "out_2"
+    channel: 2
+  - platform: template
+    id: fan_output_preprocessed
+    type: float
+    write_action:
+      - lambda: |
+          auto min_real_speed = $fan_minimum_speed_duty_cycle;
+          auto min_speed_sent_by_speed_fan = 1.0 / $fan_speed_steps;
+          auto max_speed = 1.0;
+          auto compensated = min_real_speed + ((max_speed - min_real_speed) / (max_speed - min_speed_sent_by_speed_fan)) * (state - min_speed_sent_by_speed_fan);
+          if (compensated < 0.0) {
+            compensated = 0.0;
+          }
+          ESP_LOGD("stuff", "raw output is %.2f", state);
+          ESP_LOGD("stuff", "compensated output is %.2f", compensated);
+          id(out_2).write_state(compensated);
+
+light:
+  - platform: binary
+    name: Camera light
+    id: camera_light
+    restore_mode: RESTORE_DEFAULT_OFF
+    output: out_1
+    icon: mdi:led-strip-variant
+
+fan:
+  - platform: speed
+    name: Advanced filtration system
+    id: advanced_filtration_system
+    restore_mode: RESTORE_DEFAULT_OFF
+    output: fan_output_preprocessed
+    icon: mdi:air-filter
+    speed_count: $fan_speed_steps
+    preset_modes:
+      - automatic
+    on_preset_set:
+      then:
+        - if:
+            condition:
+              lambda: |
+                return x == "automatic";
+            then:
+              - script.execute: evaluate_automatic_filtration
+
+text_sensor:
+  # Comment the following block out if you are not using the optional BME688 sensor,
+  # keep it uncommented if you are using the BME688 sensor.
+  - platform: template
+    name: "IAQ classification"
+    id: iaq_classification
+    icon: "mdi:checkbox-marked-circle-outline"
+    lambda: |-
+      auto iaq_ = int(id(iaq).state);
+      if (iaq_ < 0) {
+        // No IAQ sensor.
+        return {"unknown"};
+      }
+      if (iaq_ <= 50) {
+        return {"excellent"};
+      }
+      else if (iaq_ <= 100) {
+        return {"good"};
+      }
+      else if (iaq_ <= 150) {
+        return {"lightly polluted"};
+      }
+      else if (iaq_ <= 200) {
+        return {"moderately polluted"};
+      }
+      else if (iaq_ <= 250) {
+        return {"heavily polluted"};
+      }
+      else if (iaq_ <= 350) {
+        return {"severely polluted"};
+      }
+      else if (iaq_ <= 500) {
+        return {"extremely polluted"};
+      }
+      else {
+        // ESP_LOGD("iaq-classification", "IAQ not yet established: %s", id(static_iaq).state);
+        return {"unknown"};
+      }
+    update_interval: never
+
+  - platform: template
+    name: "Static IAQ classification"
+    id: static_iaq_classification
+    icon: "mdi:checkbox-marked-circle-outline"
+    lambda: |-
+      auto iaq_ = int(id(static_iaq).state);
+      if (iaq_ < 0) {
+        // No IAQ sensor.
+        return {"unknown"};
+      }
+      if (iaq_ <= 50) {
+        return {"excellent"};
+      }
+      else if (iaq_ <= 100) {
+        return {"good"};
+      }
+      else if (iaq_ <= 150) {
+        return {"lightly polluted"};
+      }
+      else if (iaq_ <= 200) {
+        return {"moderately polluted"};
+      }
+      else if (iaq_ <= 250) {
+        return {"heavily polluted"};
+      }
+      else if (iaq_ <= 350) {
+        return {"severely polluted"};
+      }
+      else if (iaq_ <= 500) {
+        return {"extremely polluted"};
+      }
+      else {
+        // ESP_LOGD("iaq-classification", "IAQ not yet established: %s", id(static_iaq).state);
+        return {"unknown"};
+      }
+    update_interval: never
+
+  # Comment the following block out if you are not using the optional BME688 sensor,
+  # keep it uncommented if you are using the BME688 sensor.
+  - platform: bme68x_bsec
+    iaq_accuracy: 
+      # IAQ accuracy as a text value of Stabilizing, Uncertain, Calibrating, Calibrated
+      name: "IAQ accuracy"
+
+  # Uncomment and fill in your Home Assistant 3D printer entity ID,
+  # if you don't have a sensor that supports IAQ via the `static_iaq`
+  # ID, but you do have a printer sensor that reflects printer state,
+  # in order to enable automatic filtration based on when the printer
+  # is printing.
+  # Keep commented otherwise.
+  # - platform: homeassistant
+  #   name: "Printer"
+  #   id: printer
+  #   entity_id: sensor.prusa_mk4
+  #   internal: true
+  #   on_value:
+  #     then:
+  #       - script.execute: evaluate_automatic_filtration
+  # Keep uncommented if you have a sensor that supports IAQ via the
+  # `static_iaq` ID, or you don't have a have a sensor for your 3D
+  # printer that changes based on whether the printer is printing or not.
+  - platform: template
+    lambda: |
+      return {"unknown"};
+    id: printer
+    internal: true
+    on_value:
+      then:
+        - script.execute: evaluate_automatic_filtration
