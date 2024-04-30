@@ -71,6 +71,11 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   power_save_mode: none
+  # You may want to enable the next section if the ESP32 device is
+  # not connecting to your Wi-Fi network after flashing for the
+  # first time.  Re-flash after enabling.
+  # Docs at https://esphome.io/components/wifi.html#access-point-mode
+  # ap: {}
 
 # Leave this block uncomemented for initial testing.
 # Later on, comment this block if you will only be using Home Assistant
