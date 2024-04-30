@@ -1,5 +1,6 @@
 next steps to finish:
 
+* make long press of buttons toggle automatic mode
 * maybe stiction in fans
 * automation of lighting with camera
 
