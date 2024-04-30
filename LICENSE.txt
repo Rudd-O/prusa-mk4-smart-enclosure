@@ -1,0 +1,5 @@
+The files contained in this distribution are copyrighted and distributed
+to you under the CC BY-NC 4.0 license.  The text of the license is at
+https://creativecommons.org/licenses/by-nc/4.0/
+
+Please refer to https://rudd-o.com/smk4e for more information.
