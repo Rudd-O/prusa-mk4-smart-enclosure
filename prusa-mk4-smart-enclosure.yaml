@@ -8,7 +8,7 @@ substitutions:
   fan_speed_steps: "3"
   fan_minimum_speed_duty_cycle: "0.2"
   idle_framerate: "0.1"
-  automatic_camera_light_framerate: "0.3"
+  automatic_camera_light_framerate: "0.5"
 
 esphome:
   name: ${name}
@@ -319,9 +319,7 @@ sensor:
   device_class: frequency
   disabled_by_default: true
   filters:
-    - heartbeat: 5s
-    - throttle_average: 5s
-    - delta: 0.25
+    - delta: 20%
   on_value:
     - script.execute: evaluate_automatic_lighting
 
