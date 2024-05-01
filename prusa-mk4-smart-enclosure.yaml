@@ -317,6 +317,7 @@ sensor:
   entity_category: diagnostic
   state_class: measurement
   device_class: frequency
+  disabled_by_default: true
   filters:
     - heartbeat: 5s
     - throttle_average: 5s
