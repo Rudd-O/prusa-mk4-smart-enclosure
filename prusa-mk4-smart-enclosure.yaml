@@ -104,18 +104,11 @@ globals:
 script:
   - id: enable_automatic_filtration
     then:
-      - if:
-          condition:
-            # Skip enabling when the static IAQ sensor is absent.
-            lambda: |
-              return float(id(static_iaq).state) == -2.0;
-          then: []
-          else:
-            - lambda: |
-                auto call = id(advanced_filtration_system).make_call();
-                call.set_preset_mode("automatic");
-                call.perform();
-            - script.execute: evaluate_automatic_filtration
+      - lambda: |
+          auto call = id(advanced_filtration_system).make_call();
+          call.set_preset_mode("automatic");
+          call.perform();
+      - script.execute: evaluate_automatic_filtration
   - id: evaluate_automatic_filtration
     then:
       - lambda: |
