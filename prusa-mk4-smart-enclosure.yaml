@@ -18,7 +18,6 @@ esphome:
     priority: 300
     then:
       - script.execute: enable_automatic_filtration
-      - script.execute: evaluate_automatic_filtration
       - script.execute: evaluate_automatic_lighting
     
 esp32:
@@ -103,6 +102,20 @@ globals:
     restore_value: no
 
 script:
+  - id: enable_automatic_filtration
+    then:
+      - if:
+          condition:
+            # Skip enabling when the static IAQ sensor is absent.
+            lambda: |
+              return float(id(static_iaq).state) == -2.0;
+          then: []
+          else:
+            - lambda: |
+                auto call = id(advanced_filtration_system).make_call();
+                call.set_preset_mode("automatic");
+                call.perform();
+            - script.execute: evaluate_automatic_filtration
   - id: evaluate_automatic_filtration
     then:
       - lambda: |
@@ -157,12 +170,6 @@ script:
               }
             }
           }
-  - id: enable_automatic_filtration
-    then:
-      - lambda: |
-          auto call = id(advanced_filtration_system).make_call();
-          call.set_preset_mode("automatic");
-          call.perform();
   - id: evaluate_automatic_lighting
     then:
       - lambda: |
@@ -269,7 +276,20 @@ button:
     entity_category: diagnostic
     icon: mdi:restart-alert
 
+# Could be useful to diagnose problems.
+# debug:
+#   update_interval: 5s
+
 sensor:
+# Could be useful to diagnose problems.
+# - platform: debug
+#   loop_time:
+#     disabled_by_default: true
+#     name: "Loop time"
+#   psram:
+#     disabled_by_default: true
+#     name: "Free PSRAM"
+
 - platform: template
   name: "Camera frame rate"
   id: camera_frame_rate
@@ -408,10 +428,11 @@ switch:
     internal: false
     on_turn_on:
       then:
+        - logger.log: "Automatic camera light turned on"
         - script.execute: evaluate_automatic_lighting
     on_turn_off:
       then:
-        - script.execute: evaluate_automatic_lighting
+        - logger.log: "Automatic camera light turned off"
 
 binary_sensor:
   - platform: gpio
@@ -425,39 +446,38 @@ binary_sensor:
         input: true
         pullup: true
     name: "Camera light switch"
-    on_press:
-      then:
-        - if:
-            condition:
-              lambda: |
-                return id(automatic_camera_light).state;
-            then:
-              - switch.turn_off: automatic_camera_light
-              - light.turn_off: camera_light
-            else:
-              - if:
-                  condition:
-                    light.is_on: camera_light
-                  then:
-                    - light.control:
-                        id: camera_light
-                        state: off
-                    - delay: 100ms
-                    - light.control:
-                        id: camera_light
-                        state: on
-                    - delay: 100ms
-                    - light.control:
-                        id: camera_light
-                        state: off
-                    - delay: 100ms
-                    - light.control:
-                        id: camera_light
-                        state: on
-                    - delay: 100ms
-                    - switch.turn_on: automatic_camera_light
-                  else:
-                    - light.turn_on: camera_light
+    on_multi_click:
+      - timing:
+          - ON for at most 0.5s
+        then:
+          - logger.log: "Camera light switch pressed"
+          - if:
+              condition:
+                switch.is_on: automatic_camera_light
+              then:
+                - switch.turn_off: automatic_camera_light
+          - light.toggle: camera_light
+      - timing:
+          - ON for at least 0.501s
+        then:
+          - logger.log: "Camera light switch long-pressed"
+          - light.control:
+              id: camera_light
+              state: off
+          - delay: 100ms
+          - light.control:
+              id: camera_light
+              state: on
+          - delay: 100ms
+          - light.control:
+              id: camera_light
+              state: off
+          - delay: 100ms
+          - light.control:
+              id: camera_light
+              state: on
+          - delay: 100ms
+          - switch.turn_on: automatic_camera_light
   - platform: gpio
     icon: mdi:button-pointer
     disabled_by_default: true
@@ -469,30 +489,17 @@ binary_sensor:
         input: true
         pullup: true
     name: "Advanced filtration system switch"
-    on_press:
-      then:
-        - if:
-            condition:
-              lambda: |
-                return float(id(static_iaq).state) == -2.0;
-            then:
-              - fan.cycle_speed: advanced_filtration_system
-            else:
-              - if:
-                  condition:
-                    lambda: |
-                      return id(advanced_filtration_system).preset_mode == "automatic";
-                  then:
-                    - fan.cycle_speed: advanced_filtration_system
-                  else:
-                    - if:
-                        condition:
-                          lambda: |
-                            return id(advanced_filtration_system).preset_mode != "automatic" && !id(advanced_filtration_system).state;
-                        then:
-                          - script.execute: enable_automatic_filtration
-                        else:
-                          - fan.cycle_speed: advanced_filtration_system
+    on_multi_click:
+      - timing:
+          - ON for at most 0.5s
+        then:
+          - logger.log: "Automatic filtration system switch pressed"
+          - fan.cycle_speed: advanced_filtration_system
+      - timing:
+          - ON for at least 0.501s
+        then:
+          - logger.log: "Automatic filtration system switch long-pressed"
+          - script.execute: enable_automatic_filtration
 
 output:
   - platform: gpio
