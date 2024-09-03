@@ -41,7 +41,7 @@ external_components:
   # Optionally comment the following block out if you are not using the
   # optional BME688 sensor.  Keep the following two lines uncommented otherwise.
   - source: github://neffs/esphome@bsec2_bme68x
-    components: [ bme68x_bsec2_i2c ]
+    components: [ bme68x_bsec2, bme68x_bsec2_i2c ]
 
 # Enable logging
 logger:
@@ -61,7 +61,7 @@ api:
   # Comment the following line after pairing with Home Assistant.
   # Leave it uncommented if you plan to use only the ESP32 Web server
   # integration below.
-  reboot_timeout: 0s
+  # reboot_timeout: 0s
 
 ota:
   password: "$ota_password"
@@ -368,7 +368,7 @@ sensor:
 # Keep the following block uncommented if you are using the BME688 sensor
 # with the BSEC driver (the default).  Comment it if you are using any
 # other sensor, or no sensor at all.
-- platform: bme68x_bsec2_i2c
+- platform: bme68x_bsec2
   temperature:
     name: "Temperature"
     filters:
@@ -626,7 +626,7 @@ text_sensor:
 
   # Comment the following block out if you are not using the optional BME688 sensor,
   # keep it uncommented if you are using the BME688 sensor.
-  - platform: bme68x_bsec2_i2c
+  - platform: bme68x_bsec2
     iaq_accuracy: 
       # IAQ accuracy as a text value of Stabilizing, Uncertain, Calibrating, Calibrated
       name: "IAQ accuracy"
