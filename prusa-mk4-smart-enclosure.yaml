@@ -282,6 +282,9 @@ sensor:
 #   psram:
 #     disabled_by_default: true
 #     name: "Free PSRAM"
+#   free:
+#     disabled_by_default: true
+#     name: "Free heap"
 
 - platform: template
   name: "Camera frame rate"
