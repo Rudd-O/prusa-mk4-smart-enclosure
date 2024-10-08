@@ -38,10 +38,6 @@ external_components:
       url: https://github.com/Rudd-O/esphome_freenove_camera_component
     components:
       - esp32_camera
-  # Optionally comment the following block out if you are not using the
-  # optional BME688 sensor.  Keep the following two lines uncommented otherwise.
-  - source: github://neffs/esphome@bsec2_bme68x
-    components: [ bme68x_bsec2, bme68x_bsec2_i2c ]
 
 # Enable logging
 logger:
