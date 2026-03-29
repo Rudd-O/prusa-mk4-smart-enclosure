@@ -7,8 +7,11 @@ substitutions:
   resolution: 640x480
   fan_speed_steps: "3"
   fan_minimum_speed_duty_cycle: "0.2"
+  frame_rate_buffer_size: "10"
+  resolution: 640x480
   idle_framerate: "0.1"
-  automatic_camera_light_framerate: "0.5"
+  automatic_light_framerate: "0.5"
+  max_framerate: "20"
 
 esphome:
   name: ${name}
@@ -24,30 +27,11 @@ esp32:
   board: seeed_xiao_esp32s3
   variant: esp32s3 
   framework:
-    type: arduino
-    version: 2.0.8
-    platform_version: 6.2.0
+    type: esp-idf
 
 psram:
   mode: octal
-  speed: 120MHz
-
-external_components:
-  - source:
-      type: git
-      url: https://github.com/Rudd-O/esphome_freenove_camera_component
-    components:
-      - esp32_camera
-
-# Enable logging
-logger:
-  # Change me from debug to info when everything has been tested to work correctly.
-  level: debug
-  logs:
-    pulse_counter: info
-    sensor: info
-    fan.automatic: info
-    text_sensor: info
+  speed: 80MHz
 
 # Enable Home Assistant API.
 # Comment this whole block if not using Home Assistant.
@@ -60,12 +44,13 @@ api:
   # reboot_timeout: 0s
 
 ota:
+  - platform: esphome
   password: "$ota_password"
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  power_save_mode: none
+  # power_save_mode: none
   # You may want to enable the next section if the ESP32 device is
   # not connecting to your Wi-Fi network after flashing for the
   # first time.  Re-flash after enabling.
@@ -100,19 +85,16 @@ globals:
 script:
   - id: enable_automatic_filtration
     then:
-      - lambda: |
-          auto call = id(advanced_filtration_system).make_call();
-          call.set_preset_mode("automatic");
-          call.perform();
+      - switch.turn_on: automatic_filtration
       - script.execute: evaluate_automatic_filtration
   - id: evaluate_automatic_filtration
     then:
       - lambda: |
-          if (id(advanced_filtration_system).preset_mode == "automatic") {
+          if (id(automatic_filtration).state) {
             // Q: Why do we use static IAQ?
             // A: https://community.bosch-sensortec.com/t5/MEMS-sensors-forum/Explanation-on-static-IAQ-breath-VOC-and-CO2-equivalent/m-p/7536/highlight/true#M483
             float iaq_ = float(id(static_iaq).state);
-            if (iaq_ == -2.0) {
+            if (iaq_ == -2.0) { // No IAQ sensor.  Use printer state as determinant.
               auto printer_printing = !(id(printer).state == "finished" || id(printer).state == "idle" || id(printer).state == "unknown");
               if (
                   !printer_printing
@@ -121,7 +103,6 @@ script:
                 ) {
                 ESP_LOGD("fan.automatic", "Turning off fan based on printer state");
                 auto call = id(advanced_filtration_system).make_call();
-                call.set_preset_mode("automatic"); // Copy preset mode into call so it won't get cleared
                 call.set_state(false);
                 call.perform();
               } else if (
@@ -131,12 +112,11 @@ script:
               ) {
                 ESP_LOGD("fan.automatic", "Setting fan to maximum speed because the printer is %s", id(printer).state.c_str());
                 auto call = id(advanced_filtration_system).make_call();
-                call.set_preset_mode("automatic"); // Copy preset mode into call so it won't get cleared
                 call.set_speed($fan_speed_steps);
                 call.set_state(true);
                 call.perform();
               }
-            } else {
+            } else { // IAQ sensor.  Use air quality state as determinant.
               float max_iaq = float(id(maximum_automatic_filtration).state);
               float min_iaq = float(id(minimum_automatic_filtration).state);
               int speed_we_want = int(ceil((iaq_ - min_iaq) / (max_iaq - min_iaq) * ($fan_speed_steps - 1)));
@@ -146,13 +126,11 @@ script:
               if (speed_we_want == 0 && id(advanced_filtration_system).state) {
                 ESP_LOGD("fan.automatic", "Turning off fan");
                 auto call = id(advanced_filtration_system).make_call();
-                call.set_preset_mode("automatic"); // Copy preset mode into call so it won't get cleared
                 call.set_state(false);
                 call.perform();
               } else if (speed_we_want > 0 && (!id(advanced_filtration_system).state || id(advanced_filtration_system).speed != speed_we_want)) {
                 ESP_LOGD("fan.automatic", "Setting fan to speed %d", speed_we_want);
                 auto call = id(advanced_filtration_system).make_call();
-                call.set_preset_mode("automatic"); // Copy preset mode into call so it won't get cleared
                 call.set_speed(speed_we_want);
                 call.set_state(true);
                 call.perform();
@@ -162,49 +140,90 @@ script:
   - id: evaluate_automatic_lighting
     then:
       - lambda: |
-          if (id(automatic_camera_light).state) {
+          if (id(automatic_light).state) {
             auto framerate = float(id(camera_frame_rate).state);
-            if (framerate >= $automatic_camera_light_framerate && !id(camera_light).current_values.is_on()) {
+            if (framerate >= $automatic_light_framerate && !id(light_).current_values.is_on()) {
               ESP_LOGD("light.automatic", "Turning on light based on camera state");
-              auto call = id(camera_light).turn_on();
+              auto call = id(light_).turn_on();
               call.perform();
-            } else if (framerate < $automatic_camera_light_framerate && id(camera_light).current_values.is_on()) {
+            } else if (framerate < $automatic_light_framerate && id(light_).current_values.is_on()) {
               ESP_LOGD("light.automatic", "Turning off light based on camera state");
-              auto call = id(camera_light).turn_off();
+              auto call = id(light_).turn_off();
               call.perform();
             }
           }
+  - id: blink_lights
+    then:
+      - if:
+          condition:
+            light.is_on: light_
+          then:
+            - light.control:
+                id: light_
+                state: off
+            - delay: 50ms
+            - light.control:
+                id: light_
+                state: on
+            - delay: 50ms
+            - light.control:
+                id: light_
+                state: off
+            - delay: 50ms
+            - light.control:
+                id: light_
+                state: on
+          else:
+            - light.control:
+                id: light_
+                state: on
+            - delay: 50ms
+            - light.control:
+                id: light_
+                state: off
+            - delay: 50ms
+            - light.control:
+                id: light_
+                state: on
+            - delay: 50ms
+            - light.control:
+                id: light_
+                state: off
+
 
 # Comment the following block out if you are not using any I2C sensor.
 i2c:
+  - id: sensor_i2c
   sda: GPIO40
   scl: GPIO39
 # Comment the following line if you are not using the BME688 sensor,
 # keep it uncommented if you are.
   frequency: 400kHz
+  - id: camera_i2c
+    sda: GPIO4
+    scl: GPIO5
 
 # Keep the following block uncommented if you are using the BME688 sensor.
 # Comment it if you are not.
 bme68x_bsec2_i2c:
+  i2c_id: sensor_i2c
   model: bme688
   state_save_interval: 30min
 
 esp32_camera:
   name: Camera
-  id: camera
-  framebuffer_in_psram: true
+  id: camera_
   external_clock:
     pin: GPIO15
-    frequency: 40MHz
-  i2c_pins:
-    sda: GPIO4
-    scl: GPIO5
+    frequency: 20MHz
+  i2c_id: camera_i2c
   data_pins: [GPIO11, GPIO9, GPIO8, GPIO10, GPIO12, GPIO18, GPIO17, GPIO16]
   vsync_pin: GPIO6
   href_pin: GPIO7
+  frame_buffer_count: 2
   pixel_clock_pin: GPIO13
   idle_framerate: "$idle_framerate fps"
-  max_framerate: 15 fps
+  max_framerate: "${max_framerate} fps"
   resolution: $resolution
   horizontal_mirror: false
   on_image:
@@ -216,6 +235,7 @@ number:
     id: maximum_automatic_filtration
     icon: mdi:fan-plus
     optimistic: true
+    mode: box
     entity_category: config
     unit_of_measurement: IAQ
     step: 10
@@ -231,6 +251,7 @@ number:
     id: minimum_automatic_filtration
     icon: mdi:fan-minus
     optimistic: true
+    mode: box
     entity_category: config
     unit_of_measurement: IAQ
     step: 10
@@ -271,17 +292,22 @@ button:
 
 sensor:
 # Could be useful to diagnose problems.
+# Must enable `debug:` at the top level above.
 # - platform: debug
 #   loop_time:
 #     disabled_by_default: true
+#     entity_category: diagnostic
 #     name: "Loop time"
 #   psram:
 #     disabled_by_default: true
+#    entity_category: diagnostic
 #     name: "Free PSRAM"
 #   free:
 #     disabled_by_default: true
+#    entity_category: diagnostic
 #     name: "Free heap"
 
+# This sensor is useful to know if the camera is being viewed.
 - platform: template
   name: "Camera frame rate"
   id: camera_frame_rate
@@ -329,6 +355,7 @@ sensor:
   entity_category: diagnostic
   state_class: measurement
   device_class: frequency
+  unit_of_measurement: Hz
   disabled_by_default: true
   filters:
     - delta: 20%
@@ -370,50 +397,58 @@ sensor:
 - platform: bme68x_bsec2
   temperature:
     name: "Temperature"
-    filters:
-      - median
+    filters: &delta
+      - delta:
+          min_value: 0.19
   pressure:
     name: "Pressure"
     filters:
-      - median
+      - delta:
+          min_value: 0.499
   humidity:
     name: "Humidity"
     filters:
-      - median
+      - delta:
+          min_value: 1.99%
   iaq:
     name: "IAQ"
     id: iaq
     filters:
-      - median
+      - delta:
+          min_value: 0.99
     on_value:
       - component.update: iaq_classification
   iaq_static:
     name: "Static IAQ"
     id: static_iaq
     filters:
-      - median
+      - delta:
+          min_value: 0.99
     on_value:
       - component.update: static_iaq_classification
       - script.execute: evaluate_automatic_filtration
   co2_equivalent:
-    name: "CO2 equivalent"
+    name: "CO₂ equivalent"
     filters:
-      - median
+      - delta:
+          min_value: 9.99
   breath_voc_equivalent:
     name: "Breath VOC equivalent"
     filters:
-      - median
+      - delta:
+          min_value: 4.99
   gas_resistance:
     # Gas resistance in Ω
     name: "Gas resistance"
-    entity_category: diagnostic
     filters:
       - median
+    entity_category: diagnostic
+    disabled_by_default: true
 
 switch:
   - platform: template
-    name: Automatic camera light
-    id: automatic_camera_light
+    name: Automatic light
+    id: automatic_light
     restore_mode: RESTORE_DEFAULT_ON
     optimistic: true
     icon: mdi:lightbulb-auto
@@ -421,11 +456,26 @@ switch:
     internal: false
     on_turn_on:
       then:
-        - logger.log: "Automatic camera light turned on"
+        - logger.log: "Automatic light turned on"
         - script.execute: evaluate_automatic_lighting
     on_turn_off:
       then:
-        - logger.log: "Automatic camera light turned off"
+        - logger.log: "Automatic light turned off"
+  - platform: template
+    name: Automatic filtration
+    id: automatic_filtration
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    icon: mdi:fan-auto
+    entity_category: config
+    internal: false
+    on_turn_on: 
+      then:
+        - logger.log: "Automatic filtration turned on"
+        - script.execute: evaluate_automatic_filtration
+    on_turn_off: 
+      then:
+        - logger.log: "Automatic filtration turned off"
 
 binary_sensor:
   - platform: gpio
@@ -446,31 +496,16 @@ binary_sensor:
           - logger.log: "Camera light switch pressed"
           - if:
               condition:
-                switch.is_on: automatic_camera_light
+                switch.is_on: automatic_light
               then:
-                - switch.turn_off: automatic_camera_light
-          - light.toggle: camera_light
+                - switch.turn_off: automatic_light
+          - light.toggle: light_
       - timing:
           - ON for at least 0.501s
         then:
           - logger.log: "Camera light switch long-pressed"
-          - light.control:
-              id: camera_light
-              state: off
-          - delay: 100ms
-          - light.control:
-              id: camera_light
-              state: on
-          - delay: 100ms
-          - light.control:
-              id: camera_light
-              state: off
-          - delay: 100ms
-          - light.control:
-              id: camera_light
-              state: on
-          - delay: 100ms
-          - switch.turn_on: automatic_camera_light
+          - script.execute: blink_lights
+          - switch.turn_on: automatic_light
   - platform: gpio
     icon: mdi:button-pointer
     disabled_by_default: true
@@ -487,11 +522,17 @@ binary_sensor:
           - ON for at most 0.5s
         then:
           - logger.log: "Automatic filtration system switch pressed"
+          - if:
+              condition:
+                switch.is_on: automatic_filtration
+              then:
+                - switch.turn_off: automatic_filtration
           - fan.cycle_speed: advanced_filtration_system
       - timing:
           - ON for at least 0.501s
         then:
           - logger.log: "Automatic filtration system switch long-pressed"
+          - script.execute: blink_lights
           - script.execute: enable_automatic_filtration
 
 output:
@@ -522,7 +563,7 @@ output:
 light:
   - platform: binary
     name: Camera light
-    id: camera_light
+    id: light_
     restore_mode: RESTORE_DEFAULT_OFF
     output: out_1
     icon: mdi:led-strip-variant
@@ -535,16 +576,6 @@ fan:
     output: fan_output_preprocessed
     icon: mdi:air-filter
     speed_count: $fan_speed_steps
-    preset_modes:
-      - automatic
-    on_preset_set:
-      then:
-        - if:
-            condition:
-              lambda: |
-                return x == "automatic";
-            then:
-              - script.execute: evaluate_automatic_filtration
 
 text_sensor:
   # Comment the following block out if you are not using the optional BME688 sensor,
